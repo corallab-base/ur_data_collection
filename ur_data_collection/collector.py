@@ -39,6 +39,12 @@ from tf2_geometry_msgs import do_transform_pose_stamped
 
 from goc_demo import robotiq
 
+from ur_data_collection.post_processor import (
+    SamuraiFoundationPoseProcessor,
+    SamuraiPostProcessor,
+    deduplicate_episode,
+)
+
 
 WORLD_FRAME = "world"
 
@@ -60,11 +66,13 @@ LIVE_HZ = 30
 class CollectorNode(Node):
     """Collects robot demonstration data from several topics."""
 
-    def __init__(self, post_processor=None):
+    def __init__(self, post_processors=None):
         super().__init__("collector_node")
 
-        self._post_processor = post_processor
+        self._post_processors: list = post_processors or []
         self._annotating = False
+        self._awaiting_prepare = False
+        self._prepare_episode: Optional[dict] = None
 
         # --- Parameters ---
         self.declare_parameter("pose_topic", "/tcp_pose_broadcaster/pose")
@@ -338,6 +346,15 @@ class CollectorNode(Node):
 
     def _step_display(self):
         """Must be called from the main thread each iteration."""
+        if self._awaiting_prepare and self._prepare_episode is not None:
+            self._awaiting_prepare = False
+            ep = self._prepare_episode
+            self._prepare_episode = None
+            for proc in self._post_processors:
+                proc.prepare(ep)  # may block (e.g. selectROI for SAMURAI)
+                threading.Thread(target=self._run_annotation, args=(ep,), daemon=True).start()
+            return
+
         showed = False
 
         if self._in_playback and self._playback_frames:
@@ -398,8 +415,8 @@ class CollectorNode(Node):
                 cv2.destroyWindow("Live")
 
     def _annotate_episode(self):
-        if self._post_processor is None:
-            self.get_logger().warn("No post-processor configured (set MESH_PATH to enable)")
+        if not self._post_processors:
+            self.get_logger().warn("No post-processors configured")
             return
         if not self._episodes:
             self.get_logger().warn("No completed episodes to annotate")
@@ -408,16 +425,19 @@ class CollectorNode(Node):
             self.get_logger().warn("Annotation already in progress")
             return
         self._annotating = True
-        ep = self._episodes[-1]
-        threading.Thread(target=self._run_annotation, args=(ep,), daemon=True).start()
+        self._prepare_episode = self._episodes[-1]
+        self._awaiting_prepare = True
 
     def _run_annotation(self, episode: dict):
         try:
-            self.get_logger().info("Annotation started...")
-            additions = self._post_processor.process(episode)
-            episode.update(additions)
-            n = len(additions.get("obj_pose_4x4", []))
-            self.get_logger().info(f"Annotation complete — {n} poses")
+            deduplicate_episode(episode)
+            for proc in self._post_processors:
+                self.get_logger().info(f"{proc.__class__.__name__} started...")
+                additions = proc.process(episode)
+                episode.update(additions)
+                self.get_logger().info(
+                    f"{proc.__class__.__name__} complete — keys: {list(additions.keys())}"
+                )
         except Exception as e:
             self.get_logger().error(f"Annotation failed: {e}")
             traceback.print_exc()
@@ -526,13 +546,9 @@ def main(args=None):
     os.makedirs("saved_data", exist_ok=True)
     rclpy.init(args=args)
 
-    mesh_path = os.environ.get("MESH_PATH", "")
-    processor = None
-    if mesh_path:
-        from ur_data_collection.post_processor import SamuraiFoundationPoseProcessor
-        processor = SamuraiFoundationPoseProcessor(mesh_path=mesh_path)
+    post_processors = []
 
-    node = CollectorNode(post_processor=processor)
+    node = CollectorNode(post_processors=post_processors)
 
     spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     spin_thread.start()

@@ -1,23 +1,15 @@
 #!/usr/bin/env python3
-"""Post-processing pipeline for annotating recorded episodes with object poses.
+"""Post-processing pipeline for annotating recorded episodes with object masks and poses.
 
-Usage:
-    processor = SamuraiFoundationPoseProcessor(mesh_path="/path/to/obj.obj")
-    additions = processor.process(episode)   # deduplicates episode in-place first
-    episode.update(additions)
-    # episode now has "obj_pose_4x4"
+Typical offline workflow
+------------------------
+    samurai = SamuraiPostProcessor(checkpoint="/path/to/sam2.pt")
+    fp      = SamuraiFoundationPoseProcessor(mesh_path="/path/to/obj.obj")
 
-Episodes must already contain "mask" (recorded while SAMURAI was running),
-"depth", and "camera_K". Near-duplicate frames are removed before annotation.
-FoundationPose re-registers at each local blob-size peak to limit tracking drift.
-
-The SAMURAI ROS node must be running during collection, configured to subscribe
-to the live camera topic and publish to /{obj_name}/mask.
-
-    ros2 run coral_trackers samurai_tracker --ros-args \
-        -p rgb_topic:=/camera/camera/color/image_raw \
-        -p object_name:=obj \
-        -p samurai_checkpoint:=<path>
+    # bbox [x1,y1,x2,y2] in the episode's target_img_dim pixel space,
+    # drawn by the user on frame 0 via cv2.selectROI before this call.
+    episode.update(samurai.process(episode, bbox))   # adds "mask"
+    episode.update(fp.process(episode))              # adds "obj_pose_4x4"
 """
 
 from __future__ import annotations
@@ -33,6 +25,12 @@ import torch
 import trimesh
 from tqdm import tqdm, trange
 
+SAMURAI_PATH_DEFAULT = os.path.expanduser("~/phd/software/samurai/sam2")
+SAMURAI_CONFIG_DEFAULT = "configs/samurai/sam2.1_hiera_b+.yaml"
+SAMURAI_CHECKPOINT_DEFAULT = os.path.expanduser(
+    "~/phd/software/samurai/sam2/checkpoints/sam2.1_hiera_base_plus.pt"
+)
+
 FP_ROS_PATH_DEFAULT = (
     "/home/tassos/phd/research/demos/goc_demo_workspace/src/FoundationPoseROS2"
 )
@@ -43,9 +41,165 @@ FP_ROS_PATH_DEFAULT = (
 # ---------------------------------------------------------------------------
 
 class PostProcessor(ABC):
+    def prepare(self, episode: dict) -> None:
+        """Called on the main thread before process(). Override for GUI steps."""
+
     @abstractmethod
     def process(self, episode: dict) -> dict:
-        """Annotate an episode. Returns a dict of new keys to merge in."""
+        """Annotate an episode in a background thread. Returns new keys to merge."""
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _select_roi_manual(image: np.ndarray, title: str = "Draw ROI") -> tuple:
+    """
+    Draw a bounding box by click-drag. Returns (x, y, w, h) in image pixels.
+    Returns (0, 0, 0, 0) if cancelled (C or Esc key).
+
+    Uses raw namedWindow + setMouseCallback to avoid cv2.selectROI's Qt
+    window-handler issue when OpenCV is built against a mismatched Qt version.
+    """
+    state = {"start": None, "end": None, "drawing": False, "done": False, "cancel": False}
+    base = image.copy()
+    canvas = [base.copy()]
+
+    def on_mouse(event, x, y, flags, _param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            state["start"] = (x, y)
+            state["end"] = (x, y)
+            state["drawing"] = True
+        elif event == cv2.EVENT_MOUSEMOVE and state["drawing"]:
+            state["end"] = (x, y)
+            img = base.copy()
+            cv2.rectangle(img, state["start"], state["end"], (0, 255, 0), 2)
+            canvas[0] = img
+        elif event == cv2.EVENT_LBUTTONUP:
+            state["end"] = (x, y)
+            state["drawing"] = False
+            img = base.copy()
+            cv2.rectangle(img, state["start"], state["end"], (0, 255, 0), 2)
+            canvas[0] = img
+
+    cv2.namedWindow(title, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(title, on_mouse)
+    cv2.imshow(title, canvas[0])
+
+    while True:
+        cv2.imshow(title, canvas[0])
+        key = cv2.waitKey(20) & 0xFF
+        if key in (13, ord(" ")):   # Enter or Space — confirm
+            state["done"] = True
+            break
+        if key in (ord("c"), ord("C"), 27):  # C or Esc — cancel
+            state["cancel"] = True
+            break
+
+    cv2.destroyWindow(title)
+
+    if state["cancel"] or state["start"] is None or state["end"] is None:
+        return (0, 0, 0, 0)
+
+    x1, y1 = state["start"]
+    x2, y2 = state["end"]
+    x, y = min(x1, x2), min(y1, y2)
+    w, h = abs(x2 - x1), abs(y2 - y1)
+    return (x, y, w, h)
+
+
+# ---------------------------------------------------------------------------
+# SAMURAI offline mask segmentation
+# ---------------------------------------------------------------------------
+
+class SamuraiPostProcessor(PostProcessor):
+    """
+    Runs SAMURAI (SAM2-based) offline on all episode frames to produce
+    per-frame binary object masks.
+
+    Unlike the live ROS node, all frames are given to SAM2 at once so the
+    model can use full temporal context (offline / batch mode), which is
+    both more accurate and avoids real-time latency constraints.
+
+    A bounding box prompt on frame 0 is required; it is collected on the
+    main thread by the collector before this processor is called.
+
+    Adds to the episode:
+        mask : list[np.ndarray (D,D) uint8]  — 0/255 binary mask per frame
+    """
+
+    def __init__(
+        self,
+        checkpoint: str = SAMURAI_CHECKPOINT_DEFAULT,
+        config: str = SAMURAI_CONFIG_DEFAULT,
+        samurai_path: str = SAMURAI_PATH_DEFAULT,
+    ):
+        samurai_path = os.path.expanduser(samurai_path)
+        checkpoint = os.path.expanduser(checkpoint)
+        if samurai_path not in sys.path:
+            sys.path.insert(0, samurai_path)
+
+        from sam2.build_sam import build_sam2_video_predictor
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._predictor = build_sam2_video_predictor(config, checkpoint, device=device)
+        self._bbox: Optional[np.ndarray] = None
+
+    def prepare(self, episode: dict) -> None:
+        """Show frame 0 for the user to draw a bounding box (main-thread, blocking)."""
+        frame0 = episode["img"][0]
+        D = frame0.shape[0]
+        display_dim = max(D, 480)
+
+        vis = cv2.resize(frame0, (display_dim, display_dim), interpolation=cv2.INTER_NEAREST)
+        r = _select_roi_manual(vis, "SAMURAI: drag bbox, Enter to confirm, C to cancel")
+
+        cv2.destroyAllWindows()
+        if r[2] > 0 and r[3] > 0:
+            scale = D / display_dim
+            self._bbox = np.array(
+                [r[0] * scale, r[1] * scale,
+                 (r[0] + r[2]) * scale, (r[1] + r[3]) * scale],
+                dtype=np.float32,
+            )
+        else:
+            self._bbox = None
+
+    def process(self, episode: dict) -> dict:
+        """Run SAMURAI on all episode frames using the bbox set by prepare()."""
+        if self._bbox is None:
+            raise RuntimeError("SamuraiPostProcessor: prepare() was cancelled or not called")
+
+        frames = episode["img"]   # list of (D,D,3) uint8 BGR
+        N = len(frames)
+        H, W = frames[0].shape[:2]
+
+        rgb_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames]
+
+        # Batch init: give SAM2 all frames so it can use full temporal context
+        inference_state = self._predictor.init_state(
+            frames=rgb_frames,
+            offload_video_to_cpu=True,
+            offload_state_to_cpu=True,
+        )
+
+        self._predictor.add_new_points_or_box(
+            inference_state,
+            frame_idx=0,
+            obj_id=0,
+            box=self._bbox,
+        )
+
+        masks = [np.zeros((H, W), dtype=np.uint8)] * N
+        for frame_idx, _, video_res_masks in tqdm(
+            self._predictor.propagate_in_video(inference_state),
+            total=N, desc="SAMURAI", unit="frame",
+        ):
+            masks[frame_idx] = (
+                (video_res_masks[0, 0].cpu().numpy() > 0.0).astype(np.uint8) * 255
+            )
+
+        return {"mask": masks}
 
 
 # ---------------------------------------------------------------------------
@@ -103,8 +257,6 @@ class SamuraiFoundationPoseProcessor(PostProcessor):
         )
 
     def process(self, episode: dict) -> dict:
-        deduplicate_episode(episode)
-
         frames = episode["img"]    # list of (D,D,3) uint8 BGR
         depths = episode["depth"]  # list of (D,D) float32 metres
         masks = episode["mask"]    # list of (D,D) uint8
@@ -124,58 +276,58 @@ class SamuraiFoundationPoseProcessor(PostProcessor):
         anchors = _find_registration_anchors(blob_sizes)
         poses: list = [None] * N
 
-        # # use the first registration anchor:
-        # anchor = anchors[0]
+        # use the first registration anchor:
+        anchor = anchors[0]
 
-        # rgb = cv2.cvtColor(frames[anchor], cv2.COLOR_BGR2RGB)
-        # poses[anchor] = self._est.register(
-        #     K=K, rgb=rgb, depth=depths[anchor],
-        #     ob_mask=masks[anchor] > 0, iteration=10,
-        # )
-        # pose_at_anchor = self._est.pose_last.clone()
+        rgb = cv2.cvtColor(frames[anchor], cv2.COLOR_BGR2RGB)
+        poses[anchor] = self._est.register(
+            K=K, rgb=rgb, depth=depths[anchor],
+            ob_mask=masks[anchor] > 0, iteration=10,
+        )
+        pose_at_anchor = self._est.pose_last.clone()
 
-        # # Forward: anchor+1 to end of episode
-        # for i in trange(
-        #     anchor + 1, N,
-        #     desc=f"  fwd [{anchor}→{N}]", leave=False, unit="frame",
-        # ):
-        #     rgb_i = cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)
-        #     poses[i] = self._est.track_one(rgb=rgb_i, depth=depths[i], K=K, iteration=10)
+        # Forward: anchor+1 to end of episode
+        for i in trange(
+            anchor + 1, N,
+            desc=f"  fwd [{anchor}→{N}]", leave=False, unit="frame",
+        ):
+            rgb_i = cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)
+            poses[i] = self._est.track_one(rgb=rgb_i, depth=depths[i], K=K, iteration=10)
 
-        # self._est.pose_last = pose_at_anchor.clone()
-        # for i in trange(
-        #         anchor - 1, -1, -1,
-        #         desc=f"  bwd [{anchor}→0]", leave=False, unit="frame",
-        # ):
-        #     rgb_i = cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)
-        #     poses[i] = self._est.track_one(rgb=rgb_i, depth=depths[i], K=K, iteration=10)
+        self._est.pose_last = pose_at_anchor.clone()
+        for i in trange(
+                anchor - 1, -1, -1,
+                desc=f"  bwd [{anchor}→0]", leave=False, unit="frame",
+        ):
+            rgb_i = cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)
+            poses[i] = self._est.track_one(rgb=rgb_i, depth=depths[i], K=K, iteration=10)
 
-        for seg_idx, anchor in enumerate(tqdm(anchors, desc="FP register", unit="anchor")):
-            rgb = cv2.cvtColor(frames[anchor], cv2.COLOR_BGR2RGB)
-            poses[anchor] = self._est.register(
-                K=K, rgb=rgb, depth=depths[anchor],
-                ob_mask=masks[anchor] > 0, iteration=8,
-            )
-            pose_at_anchor = self._est.pose_last.clone()
+        # for seg_idx, anchor in enumerate(tqdm(anchors, desc="FP register", unit="anchor")):
+        #     rgb = cv2.cvtColor(frames[anchor], cv2.COLOR_BGR2RGB)
+        #     poses[anchor] = self._est.register(
+        #         K=K, rgb=rgb, depth=depths[anchor],
+        #         ob_mask=masks[anchor] > 0, iteration=8,
+        #     )
+        #     pose_at_anchor = self._est.pose_last.clone()
 
-            # Forward: anchor+1 → next anchor (exclusive) or end of episode
-            next_anchor = anchors[seg_idx + 1] if seg_idx + 1 < len(anchors) else N
-            for i in trange(
-                anchor + 1, next_anchor,
-                desc=f"  fwd [{anchor}→{next_anchor - 1}]", leave=False, unit="frame",
-            ):
-                rgb_i = cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)
-                poses[i] = self._est.track_one(rgb=rgb_i, depth=depths[i], K=K, iteration=8)
+        #     # Forward: anchor+1 → next anchor (exclusive) or end of episode
+        #     next_anchor = anchors[seg_idx + 1] if seg_idx + 1 < len(anchors) else N
+        #     for i in trange(
+        #         anchor + 1, next_anchor,
+        #         desc=f"  fwd [{anchor}→{next_anchor - 1}]", leave=False, unit="frame",
+        #     ):
+        #         rgb_i = cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)
+        #         poses[i] = self._est.track_one(rgb=rgb_i, depth=depths[i], K=K, iteration=8)
 
-            # Backward from the first anchor to frame 0
-            if seg_idx == 0 and anchor > 0:
-                self._est.pose_last = pose_at_anchor.clone()
-                for i in trange(
-                    anchor - 1, -1, -1,
-                    desc=f"  bwd [{anchor}→0]", leave=False, unit="frame",
-                ):
-                    rgb_i = cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)
-                    poses[i] = self._est.track_one(rgb=rgb_i, depth=depths[i], K=K, iteration=8)
+        #     # Backward from the first anchor to frame 0
+        #     if seg_idx == 0 and anchor > 0:
+        #         self._est.pose_last = pose_at_anchor.clone()
+        #         for i in trange(
+        #             anchor - 1, -1, -1,
+        #             desc=f"  bwd [{anchor}→0]", leave=False, unit="frame",
+        #         ):
+        #             rgb_i = cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)
+        #             poses[i] = self._est.track_one(rgb=rgb_i, depth=depths[i], K=K, iteration=8)
 
         _visualize_anchors(frames, masks, poses, [anchor], K)
         return {"obj_pose_4x4": poses}
