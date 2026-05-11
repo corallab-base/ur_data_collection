@@ -548,6 +548,14 @@ def main(args=None):
 
     post_processors = []
 
+    # checkpoint = os.environ.get("SAMURAI_CHECKPOINT", "")
+    # if checkpoint:
+    post_processors.append(SamuraiPostProcessor())
+
+    mesh_path = os.environ.get("MESH_PATH", "")
+    if mesh_path:
+        post_processors.append(SamuraiFoundationPoseProcessor(mesh_path=mesh_path))
+
     node = CollectorNode(post_processors=post_processors)
 
     spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
