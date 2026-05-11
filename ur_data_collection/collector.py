@@ -66,13 +66,15 @@ LIVE_HZ = 30
 class CollectorNode(Node):
     """Collects robot demonstration data from several topics."""
 
-    def __init__(self, post_processors=None):
+    def __init__(self, post_processors=None, save_dir: str = "saved_data"):
         super().__init__("collector_node")
 
         self._post_processors: list = post_processors or []
         self._annotating = False
         self._awaiting_prepare = False
         self._prepare_episode: Optional[dict] = None
+        self._save_dir = save_dir
+        self._save_count = 0
 
         # --- Parameters ---
         self.declare_parameter("pose_topic", "/tcp_pose_broadcaster/pose")
@@ -80,8 +82,9 @@ class CollectorNode(Node):
         self.declare_parameter("depth_topic", "/camera/camera/aligned_depth_to_color/image_raw")
         self.declare_parameter("camera_info_topic", "/camera/camera/color/camera_info")
         self.declare_parameter("mask_topic", "/obj/mask")
+        self.declare_parameter("camera_optical_frame", "camera_color_optical_frame")
         self.declare_parameter("rate_hz", 20.0)
-        self.declare_parameter("target_img_dim", 128)
+        self.declare_parameter("target_img_dim", 256)
         self.declare_parameter("display_dim", DISPLAY_DIM_DEFAULT)
 
         self.bridge = CvBridge()
@@ -91,6 +94,7 @@ class CollectorNode(Node):
         self._depth_topic: str = self.get_parameter("depth_topic").value
         self._camera_info_topic: str = self.get_parameter("camera_info_topic").value
         self._mask_topic: str = self.get_parameter("mask_topic").value
+        self._camera_optical_frame: str = self.get_parameter("camera_optical_frame").value
         self._rate_hz: float = float(self.get_parameter("rate_hz").value)
         self._target_img_dim: int = (
             self.get_parameter("target_img_dim").get_parameter_value().integer_value
@@ -301,6 +305,7 @@ class CollectorNode(Node):
         if not self._recording:
             self._current_episode = defaultdict(list)
             self._current_episode["camera_K"] = self._camera_K_adjusted  # single 3×3, not a list
+            self._current_episode["T_world_camera"] = self._lookup_camera_tf()
             self._prev_ee_pos = None
             self._recording = True
             self.get_logger().info("Recording STARTED")
@@ -351,8 +356,8 @@ class CollectorNode(Node):
             ep = self._prepare_episode
             self._prepare_episode = None
             for proc in self._post_processors:
-                proc.prepare(ep)  # may block (e.g. selectROI for SAMURAI)
-                threading.Thread(target=self._run_annotation, args=(ep,), daemon=True).start()
+                proc.prepare(ep)  # may block (e.g. bbox drawing for SAMURAI)
+            threading.Thread(target=self._run_annotation, args=(ep,), daemon=True).start()
             return
 
         showed = False
@@ -448,10 +453,10 @@ class CollectorNode(Node):
         if not self._episodes:
             self.get_logger().warn("No completed episodes to save")
             return
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join("saved_data", f"episode_{ts}.pkl")
+        path = os.path.join(self._save_dir, f"episode_{self._save_count}.pkl")
         with open(path, "wb") as f:
             pickle.dump(self._episodes[-1], f)
+        self._save_count += 1
         self.get_logger().info(f"Saved episode to {path}")
 
     # --- Keyboard thread ---
@@ -484,6 +489,26 @@ class CollectorNode(Node):
         elif ch in ("q", "\x03"):
             self._running = False
 
+    def _lookup_camera_tf(self) -> Optional[np.ndarray]:
+        """Return T_world_camera as (4,4) float64, or None if TF is unavailable."""
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                WORLD_FRAME, self._camera_optical_frame,
+                Time(), timeout=Duration(seconds=1.0),
+            )
+            t = tf.transform.translation
+            r = tf.transform.rotation
+            mat = np.eye(4, dtype=np.float64)
+            mat[:3, :3] = _quat_to_rot(r.x, r.y, r.z, r.w)
+            mat[:3, 3] = [t.x, t.y, t.z]
+            return mat
+        except (LookupException, ConnectivityException, ExtrapolationException) as e:
+            self.get_logger().warn(
+                f"Could not look up camera→world TF ({self._camera_optical_frame} → "
+                f"{WORLD_FRAME}): {e}"
+            )
+            return None
+
     # --- TF helpers ---
 
     def _to_world(
@@ -509,6 +534,15 @@ class CollectorNode(Node):
             self.get_logger().warn(f"TF ({WORLD_FRAME} <- {src_frame}): {e}")
             return None
 
+
+
+def _quat_to_rot(x: float, y: float, z: float, w: float) -> np.ndarray:
+    """Quaternion (x,y,z,w) → 3×3 rotation matrix."""
+    return np.array([
+        [1 - 2*(y*y + z*z),     2*(x*y - z*w),     2*(x*z + y*w)],
+        [    2*(x*y + z*w), 1 - 2*(x*x + z*z),     2*(y*z - x*w)],
+        [    2*(x*z - y*w),     2*(y*z + x*w), 1 - 2*(x*x + y*y)],
+    ], dtype=np.float64)
 
 
 def _draw_pose_axes(
@@ -543,20 +577,23 @@ def _draw_pose_axes(
 
 
 def main(args=None):
-    os.makedirs("saved_data", exist_ok=True)
+    session_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_dir = os.path.join("saved_data", session_ts)
+    os.makedirs(save_dir, exist_ok=True)
     rclpy.init(args=args)
 
     post_processors = []
 
     # checkpoint = os.environ.get("SAMURAI_CHECKPOINT", "")
     # if checkpoint:
-    post_processors.append(SamuraiPostProcessor())
 
-    mesh_path = os.environ.get("MESH_PATH", "")
-    if mesh_path:
-        post_processors.append(SamuraiFoundationPoseProcessor(mesh_path=mesh_path))
+    # post_processors.append(SamuraiPostProcessor())
 
-    node = CollectorNode(post_processors=post_processors)
+    # mesh_path = os.environ.get("MESH_PATH", "")
+    # if mesh_path:
+    #     post_processors.append(SamuraiFoundationPoseProcessor(mesh_path=mesh_path))
+
+    node = CollectorNode(post_processors=post_processors, save_dir=save_dir)
 
     spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     spin_thread.start()
