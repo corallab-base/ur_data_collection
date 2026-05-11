@@ -32,6 +32,7 @@ setup(
     entry_points={
         'console_scripts': [
             'collector = ur_data_collection.collector:main',
+            'process_episodes = ur_data_collection.process_episodes:main',
         ],
     },
 )
