@@ -170,16 +170,25 @@ class SamuraiPostProcessor(PostProcessor):
         if self._bbox is None:
             raise RuntimeError("SamuraiPostProcessor: prepare() was cancelled or not called")
 
+        # FoundationPose calls torch.set_default_tensor_type('torch.cuda.FloatTensor')
+        # as a global side effect.  SAM2's load_video_frames_from_numpy creates
+        # img_mean_t/img_std_t via torch.tensor() — which then land on CUDA — while
+        # torch.from_numpy() always returns a CPU tensor, causing a device mismatch
+        # on every episode after the first.  Reset here before init_state is called.
+        torch.set_default_tensor_type(torch.FloatTensor)
+
         frames = episode["img"]   # list of (D,D,3) uint8 BGR
         N = len(frames)
         H, W = frames[0].shape[:2]
 
         rgb_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames]
 
-        # Batch init: give SAM2 all frames so it can use full temporal context
+        # Batch init: give SAM2 all frames so it can use full temporal context.
+        # Keep video frames on the model device (no offload_video_to_cpu) so that
+        # SAM2's normalisation constants and the frame tensors are always co-located.
+        # offload_state_to_cpu keeps the per-frame feature cache on CPU to save VRAM.
         inference_state = self._predictor.init_state(
             frames=rgb_frames,
-            offload_video_to_cpu=True,
             offload_state_to_cpu=True,
         )
 
@@ -199,6 +208,7 @@ class SamuraiPostProcessor(PostProcessor):
                 (video_res_masks[0, 0].cpu().numpy() > 0.0).astype(np.uint8) * 255
             )
 
+        self._predictor.reset_state(inference_state)
         return {"mask": masks}
 
 

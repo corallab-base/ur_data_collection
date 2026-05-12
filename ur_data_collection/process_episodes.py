@@ -191,6 +191,14 @@ def main():
             n_skipped += 1
             continue
 
+        # --- Deduplicate near-identical frames ---
+        from ur_data_collection.post_processor import deduplicate_episode
+        before = len(episode.get("img", []))
+        deduplicate_episode(episode)
+        after = len(episode.get("img", []))
+        if after < before:
+            print(f"  Deduplicated: {before} → {after} frames")
+
         # --- prepare() — GUI steps on the main thread ---
         for proc in post_processors:
             proc.prepare(episode)
