@@ -125,6 +125,7 @@ class CollectorNode(Node):
         self._latest_q: Optional[np.ndarray] = None
         self._latest_qd: Optional[np.ndarray] = None
         self._latest_eff: Optional[np.ndarray] = None
+        self._latest_joint_names: Optional[list] = None
         self._latest_image: Optional[np.ndarray] = None
         self._latest_depth: Optional[np.ndarray] = None
         self._latest_mask: Optional[np.ndarray] = None
@@ -180,6 +181,8 @@ class CollectorNode(Node):
     # --- Sensor callbacks ---
 
     def _on_joints(self, msg: JointState):
+        if self._latest_joint_names is None and msg.name:
+            self._latest_joint_names = list(msg.name)
         self._latest_q = np.array(msg.position)
         self._latest_qd = np.array(msg.velocity)
         self._latest_eff = np.array(msg.effort)
@@ -306,6 +309,7 @@ class CollectorNode(Node):
             self._current_episode = defaultdict(list)
             self._current_episode["camera_K"] = self._camera_K_adjusted  # single 3×3, not a list
             self._current_episode["T_world_camera"] = self._lookup_camera_tf()
+            self._current_episode["joint_names"] = self._latest_joint_names
             self._prev_ee_pos = None
             self._recording = True
             self.get_logger().info("Recording STARTED")
