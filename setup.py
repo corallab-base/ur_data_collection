@@ -33,6 +33,7 @@ setup(
         'console_scripts': [
             'collector = ur_data_collection.collector:main',
             'process_episodes = ur_data_collection.process_episodes:main',
+            'replay_episode = ur_data_collection.replay_episode:main',
         ],
     },
 )
