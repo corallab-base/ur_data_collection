@@ -1,0 +1,36 @@
+#+title: ur_data_collection
+
+* Usage
+
+After turning on the robot and loading the correct installation file:
+
+** Connect to the robot
+
+: ros2 launch ur_data_collection collector.launch.py
+
+** Turn on the freedrive_mode_controller
+
+: ros2 control switch_controllers --activate freedrive_mode_controller --deactivate scaled_joint_trajectory_controller
+
+** Load the saved hand-eye calibration for the camera
+
+: ros2 launch ur_data_collection saved_calibration.launch.py
+
+Then, go to rviz, add an InteractiveMarkerNode, set its topic to
+/tf_tweaker_node, right click on the marker in the central window, and press
+"publish static transform"
+
+** Start the collector
+
+: ros2 launch ur_data_collection collector.launch.py
+
+Then, after enough episodes have been recorded and saved
+
+** Run the post processing script
+
+#+begin_src shell
+ros2 run ur_data_collection process_episodes "/home/tassos/phd/software/ros_workspaces/test_ws/saved_data/20260511_213828" \
+     --interactive \
+     --samurai-checkpoint "~/phd/software/samurai/sam2/checkpoints/sam2.1_hiera_base_plus.pt" \
+     --mesh-path /home/tassos/phd/data/ycb/003_cracker_box_google_16k/003_cracker_box/google_16k/textured.obj
+#+end_src
