@@ -2,11 +2,16 @@
 
 * Usage
 
-After turning on the robot and loading the correct installation file:
+After turning on the robot and loading the correct installation and control
+program files:
 
 ** Connect to the robot
 
 : ros2 launch ur_data_collection collector.launch.py
+
+** Activate the robot control program
+
+Press the play button on the tablet.
 
 ** Turn on the freedrive_mode_controller
 
@@ -33,4 +38,12 @@ ros2 run ur_data_collection process_episodes "/home/tassos/phd/software/ros_work
      --interactive \
      --samurai-checkpoint "~/phd/software/samurai/sam2/checkpoints/sam2.1_hiera_base_plus.pt" \
      --mesh-path /home/tassos/phd/data/ycb/003_cracker_box_google_16k/003_cracker_box/google_16k/textured.obj
+#+end_src
+
+** Run the replay script
+
+#+begin_src shell
+ros2 launch ur_data_collection replay_episode.launch.py \
+     episode_path:=/home/moritz/src/ros-ws/saved_data/20260512_231419/episode_63.pkl \
+     rate_hz:=30.0
 #+end_src
