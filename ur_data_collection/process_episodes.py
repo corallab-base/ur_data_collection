@@ -113,8 +113,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "episode_dir",
-        help="Directory containing episode_*.pkl files",
+        "episode_dir_or_path",
+        help="Directory containing or path to episode_*.pkl files",
     )
     parser.add_argument(
         "--interactive", action="store_true",
@@ -163,13 +163,16 @@ def main():
         sys.exit(0)
 
     # --- Discover episodes ---
-    pattern = os.path.join(args.episode_dir, "episode_*.pkl")
-    episode_files = sorted(glob.glob(pattern))
-    if not episode_files:
-        print(f"No episode_*.pkl files found in {args.episode_dir!r}")
-        sys.exit(1)
+    if os.path.isdir(args.episode_dir_or_path):
+        pattern = os.path.join(args.episode_dir_or_path, "episode_*.pkl")
+        episode_files = sorted(glob.glob(pattern))
+        if not episode_files:
+            print(f"No episode_*.pkl files found in {args.episode_dir_or_path!r}")
+            sys.exit(1)
+    else:
+        episode_files = [args.episode_dir_or_path]
 
-    print(f"\nFound {len(episode_files)} episode(s) in {args.episode_dir!r}\n")
+    print(f"\nFound {len(episode_files)} episode(s) in {args.episode_dir_or_path!r}\n")
 
     n_processed = 0
     n_skipped = 0
