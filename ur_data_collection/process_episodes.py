@@ -155,6 +155,7 @@ def main():
             SamuraiFoundationPoseProcessor(
                 mesh_path=args.mesh_path,
                 apply_scale=args.apply_scale,
+                query_point=(0.4, 0.5),
             )
         )
         print("FoundationPose ready.")

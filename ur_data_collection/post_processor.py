@@ -218,13 +218,13 @@ class SamuraiPostProcessor(PostProcessor):
 
 class SamuraiFoundationPoseProcessor(PostProcessor):
     """
-    Uses per-frame masks already recorded in an episode (from a running SAMURAI
-    node) to estimate 6D object pose via FoundationPose.
+    Estimates 6D object pose via FoundationPose.
 
-    Near-duplicate frames are removed in-place before processing. FoundationPose
-    re-registers at each local blob-size peak (SAMURAI confidence peak) and
-    tracks forward to the next anchor, keeping drift short. The first anchor
-    also tracks backward to cover frame 0.
+    If the episode already contains per-frame masks (e.g. from SamuraiPostProcessor),
+    the frame with the largest mask blob is used as the registration anchor.  If no
+    masks are present, a SAM2 image predictor is run on frame 0 with a fixed query
+    point to obtain a single registration mask, avoiding the need to run the full
+    SAMURAI video segmentation first.
 
     Adds to the episode:
         obj_pose_4x4 : list[np.ndarray (4,4)]  — object-in-camera SE(3)
@@ -235,7 +235,12 @@ class SamuraiFoundationPoseProcessor(PostProcessor):
         mesh_path: str,
         apply_scale: float = 1.0,
         fp_ros_path: str = FP_ROS_PATH_DEFAULT,
+        checkpoint: str = SAMURAI_CHECKPOINT_DEFAULT,
+        config: str = SAMURAI_CONFIG_DEFAULT,
+        samurai_path: str = SAMURAI_PATH_DEFAULT,
+        query_point: Optional[tuple] = None,
     ):
+        # --- FoundationPose ---
         if fp_ros_path not in sys.path:
             sys.path.insert(0, fp_ros_path)
         fp_path = os.path.join(fp_ros_path, "FoundationPose")
@@ -266,10 +271,24 @@ class SamuraiFoundationPoseProcessor(PostProcessor):
             debug=0,
         )
 
+        # --- SAM2 image predictor (for mask-free initialization) ---
+        samurai_path = os.path.expanduser(samurai_path)
+        checkpoint = os.path.expanduser(checkpoint)
+        if samurai_path not in sys.path:
+            sys.path.insert(0, samurai_path)
+
+        from sam2.build_sam import build_sam2
+        from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._sam2_predictor = SAM2ImagePredictor(build_sam2(config, checkpoint, device=device))
+        self._query_point: tuple = query_point
+        self._last_query_point: Optional[tuple] = None  # set from previous episode's pose
+
     def process(self, episode: dict) -> dict:
         frames = episode["img"]    # list of (D,D,3) uint8 BGR
         depths = episode["depth"]  # list of (D,D) float32 metres
-        masks = episode["mask"]    # list of (D,D) uint8
+        masks = episode.get("mask")  # list of (D,D) uint8, or None
         K = episode.get("camera_K")
         if K is None:
             raise ValueError("Episode has no 'camera_K' — was it recorded with depth?")
@@ -277,22 +296,24 @@ class SamuraiFoundationPoseProcessor(PostProcessor):
         if N == 0:
             return {"obj_pose_4x4": []}
 
-        blob_sizes = [int((m > 0).sum()) for m in masks]
-        if max(blob_sizes) == 0:
-            raise ValueError(
-                "All masks are empty — was SAMURAI running and tracking an object?"
-            )
+        # Determine registration anchor and its mask.
+        # If per-frame SAMURAI masks are available, pick the frame with the largest
+        # blob as the anchor.  Otherwise fall back to SAM2 on frame 0.
+        has_masks = masks is not None and max(int((m > 0).sum()) for m in masks) > 0
+        if has_masks:
+            blob_sizes = [int((m > 0).sum()) for m in masks]
+            anchor = _find_registration_anchors(blob_sizes)[0]
+            reg_mask = masks[anchor] > 0
+        else:
+            anchor = 0
+            reg_mask = self._sam2_init_mask(frames[0])
 
-        anchors = _find_registration_anchors(blob_sizes)
         poses: list = [None] * N
-
-        # use the first registration anchor:
-        anchor = anchors[0]
 
         rgb = cv2.cvtColor(frames[anchor], cv2.COLOR_BGR2RGB)
         poses[anchor] = self._est.register(
             K=K, rgb=rgb, depth=depths[anchor],
-            ob_mask=masks[anchor] > 0, iteration=10,
+            ob_mask=reg_mask, iteration=10,
         )
         pose_at_anchor = self._est.pose_last.clone()
 
@@ -306,58 +327,48 @@ class SamuraiFoundationPoseProcessor(PostProcessor):
 
         self._est.pose_last = pose_at_anchor.clone()
         for i in trange(
-                anchor - 1, -1, -1,
-                desc=f"  bwd [{anchor}→0]", leave=False, unit="frame",
+            anchor - 1, -1, -1,
+            desc=f"  bwd [{anchor}→0]", leave=False, unit="frame",
         ):
             rgb_i = cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)
             poses[i] = self._est.track_one(rgb=rgb_i, depth=depths[i], K=K, iteration=10)
 
-        # for seg_idx, anchor in enumerate(tqdm(anchors, desc="FP register", unit="anchor")):
-        #     rgb = cv2.cvtColor(frames[anchor], cv2.COLOR_BGR2RGB)
-        #     poses[anchor] = self._est.register(
-        #         K=K, rgb=rgb, depth=depths[anchor],
-        #         ob_mask=masks[anchor] > 0, iteration=8,
-        #     )
-        #     pose_at_anchor = self._est.pose_last.clone()
+        _visualize_anchors(frames, masks or [], poses, [anchor], K)
 
-        #     # Forward: anchor+1 → next anchor (exclusive) or end of episode
-        #     next_anchor = anchors[seg_idx + 1] if seg_idx + 1 < len(anchors) else N
-        #     for i in trange(
-        #         anchor + 1, next_anchor,
-        #         desc=f"  fwd [{anchor}→{next_anchor - 1}]", leave=False, unit="frame",
-        #     ):
-        #         rgb_i = cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)
-        #         poses[i] = self._est.track_one(rgb=rgb_i, depth=depths[i], K=K, iteration=8)
+        # Cache the projected 2D centre of the last valid pose for the next episode.
+        last_pose = next((p for p in reversed(poses) if p is not None), None)
+        if last_pose is not None:
+            self._last_query_point = _project_pose_to_frac(last_pose, K, frames[0].shape)
 
-        #     # Backward from the first anchor to frame 0
-        #     if seg_idx == 0 and anchor > 0:
-        #         self._est.pose_last = pose_at_anchor.clone()
-        #         for i in trange(
-        #             anchor - 1, -1, -1,
-        #             desc=f"  bwd [{anchor}→0]", leave=False, unit="frame",
-        #         ):
-        #             rgb_i = cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)
-        #             poses[i] = self._est.track_one(rgb=rgb_i, depth=depths[i], K=K, iteration=8)
-
-        _visualize_anchors(frames, masks, poses, [anchor], K)
         return {"obj_pose_4x4": poses}
 
-    def _anchor_translation(
-        self,
-        mask: np.ndarray,
-        depth: np.ndarray,
-        K: np.ndarray,
-    ) -> None:
-        """Shift pose_last translation to the mask's 3D centroid when available."""
-        if self._est.pose_last is None:
-            return
-        center = _mean_xyz_from_mask(mask, depth, K)
-        if center is None:
-            return
-        pl = self._est.pose_last
-        p = pl.detach().cpu().numpy().reshape(4, 4).copy()
-        p[:3, 3] = center
-        self._est.pose_last = torch.from_numpy(p).reshape(pl.shape).to(pl.device)
+    def _sam2_init_mask(self, frame: np.ndarray) -> np.ndarray:
+        """Return a bool mask for frame using SAM2 with a query point.
+
+        Priority:
+          1. Explicit query_point set at construction — always used when provided.
+          2. Projected centre of the last valid pose from the previous episode.
+          3. Image centre (0.5, 0.5).
+        """
+        if self._query_point is not None:
+            qp = self._query_point
+        elif self._last_query_point is not None:
+            qp = self._last_query_point
+        else:
+            qp = (0.5, 0.5)
+        H, W = frame.shape[:2]
+        x = int(qp[0] * W)
+        y = int(qp[1] * H)
+        torch.set_default_tensor_type(torch.FloatTensor)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        with torch.inference_mode():
+            self._sam2_predictor.set_image(rgb)
+            masks_out, scores, _ = self._sam2_predictor.predict(
+                point_coords=np.array([[x, y]]),
+                point_labels=np.array([1]),
+                multimask_output=True,
+            )
+        return masks_out[int(np.argmax(scores))].astype(bool)
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +531,21 @@ def _visualize_anchors(
         print(f"  anchor {idx}: frame {anchor}  → {path}")
 
 
+def _project_pose_to_frac(
+    pose: np.ndarray,
+    K: np.ndarray,
+    img_shape: tuple,
+) -> tuple:
+    """Project a 4×4 camera-frame pose origin to (x_frac, y_frac) in [0, 1]²."""
+    t = pose[:3, 3]
+    if t[2] <= 0:
+        return (0.5, 0.5)
+    u = K[0, 0] * t[0] / t[2] + K[0, 2]
+    v = K[1, 1] * t[1] / t[2] + K[1, 2]
+    H, W = img_shape[:2]
+    return (float(np.clip(u / W, 0.0, 1.0)), float(np.clip(v / H, 0.0, 1.0)))
+
+
 def _find_registration_anchors(
     blob_sizes: list,
     min_separation: int = 15,
@@ -591,45 +617,4 @@ def _quat_to_mat(q: np.ndarray) -> np.ndarray:
     ])
 
 
-def _mean_xyz_from_mask(
-    mask_u8: np.ndarray,
-    depth_m: np.ndarray,
-    K: np.ndarray,
-    mad_threshold: float = 2.5,
-) -> Optional[np.ndarray]:
-    """Mean 3D point of mask pixels, with MAD-based depth outlier rejection.
 
-    Adapted from coral_trackers/mask_center_tracker.py.
-    K must be a 3×3 camera matrix.
-    Returns (3,) float32 [X, Y, Z] in camera frame, or None if insufficient depth.
-    """
-    fx, fy = float(K[0, 0]), float(K[1, 1])
-    cx, cy = float(K[0, 2]), float(K[1, 2])
-
-    ys, xs = np.where(mask_u8 > 0)
-    if ys.size == 0:
-        return None
-    zs = depth_m[ys, xs].astype(np.float32)
-    valid = np.isfinite(zs) & (zs > 0)
-    if not np.any(valid):
-        return None
-    xs = xs[valid].astype(np.float32)
-    ys = ys[valid].astype(np.float32)
-    zs = zs[valid]
-
-    median_z = float(np.median(zs))
-    mad = float(np.median(np.abs(zs - median_z)))
-    if mad > 0:
-        inliers = np.abs(zs - median_z) <= mad_threshold * mad
-        xs, ys, zs = xs[inliers], ys[inliers], zs[inliers]
-    if zs.size == 0:
-        return None
-
-    return np.array(
-        [
-            (xs - cx) @ zs / (fx * zs.size),
-            (ys - cy) @ zs / (fy * zs.size),
-            zs.mean(),
-        ],
-        dtype=np.float32,
-    )
