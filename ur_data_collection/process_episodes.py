@@ -113,8 +113,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "episode_dir_or_path",
-        help="Directory containing or path to episode_*.pkl files",
+        "dirs_or_paths", nargs="+", metavar="DIR_OR_PATH",
+        help="One or more directories containing episode_*.pkl files, "
+             "or individual episode .pkl paths",
     )
     parser.add_argument(
         "--interactive", action="store_true",
@@ -163,16 +164,21 @@ def main():
         sys.exit(0)
 
     # --- Discover episodes ---
-    if os.path.isdir(args.episode_dir_or_path):
-        pattern = os.path.join(args.episode_dir_or_path, "episode_*.pkl")
-        episode_files = sorted(glob.glob(pattern))
-        if not episode_files:
-            print(f"No episode_*.pkl files found in {args.episode_dir_or_path!r}")
-            sys.exit(1)
-    else:
-        episode_files = [args.episode_dir_or_path]
+    episode_files = []
+    for p in args.dirs_or_paths:
+        if os.path.isdir(p):
+            found = sorted(glob.glob(os.path.join(p, "episode_*.pkl")))
+            if not found:
+                print(f"Warning: no episode_*.pkl files found in {p!r}")
+            episode_files.extend(found)
+        else:
+            episode_files.append(p)
 
-    print(f"\nFound {len(episode_files)} episode(s) in {args.episode_dir_or_path!r}\n")
+    if not episode_files:
+        print("No episodes found.")
+        sys.exit(1)
+
+    print(f"\nFound {len(episode_files)} episode(s)\n")
 
     n_processed = 0
     n_skipped = 0
