@@ -22,9 +22,13 @@ from rclpy.time import Time
 from rclpy.node import Node
 from rclpy.duration import Duration
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.action import ActionClient
 
 from sensor_msgs.msg import Image, JointState, CameraInfo
 from geometry_msgs.msg import PoseStamped, Pose
+from trajectory_msgs.msg import JointTrajectoryPoint
+from controller_manager_msgs.srv import SwitchController
+from control_msgs.action import FollowJointTrajectory
 
 from cv_bridge import CvBridge
 
@@ -52,6 +56,7 @@ KEYBINDINGS = (
     "\n"
     "  r  — start / stop recording\n"
     "  g  — open / close gripper\n"
+    "  h  — return to home position (captured at startup)\n"
     "  p  — toggle live camera preview\n"
     "  v  — play back most recent episode  (Q / ESC inside window to stop)\n"
     "  a  — annotate most recent episode with post-processor\n"
@@ -86,6 +91,12 @@ class CollectorNode(Node):
         self.declare_parameter("rate_hz", 20.0)
         self.declare_parameter("target_img_dim", 256)
         self.declare_parameter("display_dim", DISPLAY_DIM_DEFAULT)
+        self.declare_parameter("home_controller", "scaled_joint_trajectory_controller")
+        self.declare_parameter("freedrive_controller", "freedrive_mode_controller")
+        self.declare_parameter("home_duration_sec", 5.0)
+        # Comma-separated joint angles in radians, e.g. "0.0,-1.57,0.0,-1.57,0.0,0.0".
+        # If empty (default), the position is captured from the first /joint_states message.
+        self.declare_parameter("home_q", "")
 
         self.bridge = CvBridge()
 
@@ -102,6 +113,17 @@ class CollectorNode(Node):
         self._display_dim: int = (
             self.get_parameter("display_dim").get_parameter_value().integer_value
         )
+        self._home_controller: str = self.get_parameter("home_controller").value
+        self._freedrive_controller: str = self.get_parameter("freedrive_controller").value
+        self._home_duration_sec: float = float(self.get_parameter("home_duration_sec").value)
+        _home_q_str: str = self.get_parameter("home_q").value
+        if _home_q_str.strip():
+            self._home_q: Optional[np.ndarray] = np.array(
+                [float(v) for v in _home_q_str.split(",")]
+            )
+            self.get_logger().info(f"Home position set from parameter: {self._home_q.tolist()}")
+        else:
+            self._home_q: Optional[np.ndarray] = None  # captured on first /joint_states
 
         if self._rate_hz <= 0.0:
             self.get_logger().warn("rate_hz must be > 0; defaulting to 20.0")
@@ -112,6 +134,16 @@ class CollectorNode(Node):
         # --- TF ---
         self.tf_buffer = Buffer(cache_time=Duration(seconds=10.0))
         self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=True)
+
+        # --- Home position ---
+        self._homing = False
+        self._switch_ctrl_client = self.create_client(
+            SwitchController, "/controller_manager/switch_controller"
+        )
+        self._jtc_client = ActionClient(
+            self, FollowJointTrajectory,
+            f"/{self._home_controller}/follow_joint_trajectory",
+        )
 
         # --- QoS ---
         sensor_qos = QoSProfile(
@@ -186,6 +218,9 @@ class CollectorNode(Node):
         self._latest_q = np.array(msg.position)
         self._latest_qd = np.array(msg.velocity)
         self._latest_eff = np.array(msg.effort)
+        if self._home_q is None and len(msg.position) > 0:
+            self._home_q = np.array(msg.position)
+            self.get_logger().info(f"Home position captured from startup state: {np.round(self._home_q, 3).tolist()}")
 
     def _on_pose(self, msg: PoseStamped):
         ps_w = self._to_world(msg)
@@ -482,6 +517,8 @@ class CollectorNode(Node):
             self._toggle_recording()
         elif ch == "g":
             self._toggle_gripper()
+        elif ch == "h":
+            self._return_to_home()
         elif ch == "p":
             self._toggle_live_preview()
         elif ch == "v":
@@ -492,6 +529,100 @@ class CollectorNode(Node):
             self._save_episode()
         elif ch in ("q", "\x03"):
             self._running = False
+
+    # --- Homing ---
+
+    def _return_to_home(self):
+        if self._home_q is None:
+            self.get_logger().warn("Home position not yet captured — wait for /joint_states")
+            return
+        if self._latest_joint_names is None:
+            self.get_logger().warn("Joint names not yet received — wait for /joint_states")
+            return
+        if self._homing:
+            self.get_logger().warn("Already homing")
+            return
+        if self._recording:
+            self._toggle_recording()
+        self._homing = True
+        threading.Thread(target=self._run_home_sequence, daemon=True).start()
+
+    def _run_home_sequence(self):
+        try:
+            self.get_logger().info(
+                f"Homing: deactivating {self._freedrive_controller}, "
+                f"activating {self._home_controller}..."
+            )
+            self._switch_controllers(
+                activate=[self._home_controller],
+                deactivate=[self._freedrive_controller],
+            )
+            self.get_logger().info(
+                f"Homing: moving to home over {self._home_duration_sec:.1f}s..."
+            )
+            self._send_home_trajectory()
+            self.get_logger().info(
+                f"Homing: reactivating {self._freedrive_controller}..."
+            )
+            self._switch_controllers(
+                activate=[self._freedrive_controller],
+                deactivate=[self._home_controller],
+            )
+            self.get_logger().info("Homing complete.")
+        except Exception as e:
+            self.get_logger().error(f"Home sequence failed: {e}")
+            traceback.print_exc()
+        finally:
+            self._homing = False
+
+    def _switch_controllers(self, activate: list, deactivate: list, timeout_sec: float = 5.0):
+        if not self._switch_ctrl_client.wait_for_service(timeout_sec=2.0):
+            raise RuntimeError("/controller_manager/switch_controller service not available")
+        req = SwitchController.Request()
+        req.activate_controllers = activate
+        req.deactivate_controllers = deactivate
+        req.strictness = SwitchController.Request.STRICT
+        req.activate_asap = True
+        future = self._switch_ctrl_client.call_async(req)
+        result = self._wait_future(future, timeout_sec=timeout_sec)
+        if not result.ok:
+            raise RuntimeError(
+                f"switch_controller rejected: activate={activate} deactivate={deactivate}"
+            )
+
+    def _send_home_trajectory(self):
+        if not self._jtc_client.wait_for_server(timeout_sec=5.0):
+            raise RuntimeError(
+                f"Action server not available: /{self._home_controller}/follow_joint_trajectory"
+            )
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = self._latest_joint_names
+        pt = JointTrajectoryPoint()
+        pt.positions = self._home_q.tolist()
+        pt.time_from_start = Duration(seconds=self._home_duration_sec).to_msg()
+        goal.trajectory.points = [pt]
+
+        goal_future = self._jtc_client.send_goal_async(goal)
+        goal_handle = self._wait_future(goal_future, timeout_sec=5.0)
+        if not goal_handle.accepted:
+            raise RuntimeError("FollowJointTrajectory goal was rejected")
+
+        result_response = self._wait_future(
+            goal_handle.get_result_async(),
+            timeout_sec=self._home_duration_sec + 10.0,
+        )
+        if result_response.result.error_code != FollowJointTrajectory.Result.SUCCESSFUL:
+            raise RuntimeError(
+                f"Trajectory execution failed: error_code={result_response.result.error_code}"
+            )
+
+    def _wait_future(self, future, timeout_sec: float = 10.0):
+        deadline = time.monotonic() + timeout_sec
+        while not future.done():
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"ROS future timed out after {timeout_sec}s")
+            time.sleep(0.05)
+        return future.result()
 
     def _lookup_camera_tf(self) -> Optional[np.ndarray]:
         """Return T_world_camera as (4,4) float64, or None if TF is unavailable."""
