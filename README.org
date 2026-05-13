@@ -22,7 +22,7 @@ Then, go to rviz, add an InteractiveMarkerNode, set its topic to
 
 ** Start the collector
 
-: ros2 launch ur_data_collection collector.launch.py
+: ros2 run ur_data_collection collector
 
 Then, after enough episodes have been recorded and saved
 
